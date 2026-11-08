@@ -2,14 +2,15 @@
 
 // ==================== 硬件相关 ====================
 // Blue Pill 板载 LED：PC13，低电平点亮（active LOW）。
-// PC13 没有定时器通道，analogWrite() 无效，所以呼吸/渐变都用「软件 PWM」实现。
+// PC13 没有定时器通道，analogWrite() 无效，所以呼吸/渐变/SOS 都用「软件 PWM」实现。
 #define LED_PIN PC13
 
 // ==================== 模式定义 ====================
 enum LightMode {
   MODE_OFF    = 0,   // 0: 熄灭
   MODE_ON     = 1,   // 1: 常亮
-  MODE_BREATH = 2    // 2: 呼吸灯
+  MODE_BREATH = 2,   // 2: 呼吸灯
+  MODE_SOS    = 3    // 3: SOS 求救信号（三短三长三短）
 };
 
 LightMode currentMode = MODE_OFF;  // 默认初始模式为熄灭
@@ -29,6 +30,43 @@ static const uint16_t kPwmFrameUs = 1000;
 // 400 干脆利落 / 700 柔和 / 1200 很慢很柔
 static const uint32_t kFadeFullScaleMs = 700;
 
+// 【可调】SOS 模式亮灭边沿的渐变时长：亮度走完 0 → 100% 的时间（毫秒）
+// SOS 的短信号只有 200 ms，若沿用 700 ms 斜坡会来不及达到全亮，所以单独用更快的斜率。
+// 0 为硬切换；20 ms 既保留一点柔和边沿，又不影响 SOS 的节奏。
+static const uint32_t kSosFadeFullScaleMs = 20;
+
+// 【可调】SOS 节奏基本单位：短信号 = 1 单位，长信号 = 3 单位（毫秒）
+static const uint16_t kSosUnitMs = 200;
+
+struct SosSegment {
+  bool on;
+  uint16_t durationMs;
+};
+
+// SOS = 三短(S) + 字母间隔 + 三长(O) + 字母间隔 + 三短(S) + 轮间隔
+static constexpr SosSegment kSosPattern[] = {
+    {true, kSosUnitMs},            {false, kSosUnitMs},            // S ·
+    {true, kSosUnitMs},            {false, kSosUnitMs},            // S ·
+    {true, kSosUnitMs},            {false, 3 * kSosUnitMs},        // S 结束，字母间隔
+    {true, 3 * kSosUnitMs},        {false, kSosUnitMs},            // O —
+    {true, 3 * kSosUnitMs},        {false, kSosUnitMs},            // O —
+    {true, 3 * kSosUnitMs},        {false, 3 * kSosUnitMs},        // O 结束，字母间隔
+    {true, kSosUnitMs},            {false, kSosUnitMs},            // S ·
+    {true, kSosUnitMs},            {false, kSosUnitMs},            // S ·
+    {true, kSosUnitMs},            {false, 7 * kSosUnitMs},        // S 结束，轮间隔
+};
+
+// 自动累加节奏表，避免手写总时长与表格不一致
+constexpr uint32_t sosCycleMs() {
+  uint32_t total = 0;
+  for (const SosSegment &segment : kSosPattern) {
+    total += segment.durationMs;
+  }
+  return total;
+}
+
+static constexpr uint32_t kSosCycleMs = sosCycleMs();  // 34 × 200 = 6800 ms
+
 // 亮度换算脉宽的除数：duty(µs) = level² / kDutyScale
 static const uint32_t kDutyScale = ((uint32_t)kLevelMax * kLevelMax) / kPwmFrameUs;
 
@@ -36,6 +74,7 @@ static const uint32_t kDutyScale = ((uint32_t)kLevelMax * kLevelMax) / kPwmFrame
 static int32_t  currentLevel  = 0;  // 当前实际亮度（被 fade 斜坡限制，不会突变）
 static uint32_t lastFrameMs   = 0;  // 上一帧的时间戳
 static uint32_t breathStartMs = 0;  // 进入呼吸模式的时刻（用于计算相位）
+static uint32_t sosStartMs    = 0;  // 进入 SOS 模式的时刻（用于计算节奏）
 
 // ---- 底层：点亮 / 熄灭（on = 亮；PC13 低电平亮）----
 static inline void ledWrite(bool on) {
@@ -53,6 +92,16 @@ static int32_t targetLevel(uint32_t nowMs) {
       const uint32_t tri = (t < half) ? t : (kBreathPeriodMs - t);     // 三角波 0→half→0
       return (int32_t)((tri * (uint32_t)kLevelMax) / half);
     }
+    case MODE_SOS: {
+      uint32_t t = (nowMs - sosStartMs) % kSosCycleMs;  // 当前在 6.8 秒周期中的位置
+      for (const SosSegment &segment : kSosPattern) {
+        if (t < segment.durationMs) {
+          return segment.on ? kLevelMax : 0;
+        }
+        t -= segment.durationMs;
+      }
+      return 0;  // 理论不可达，兜底熄灭
+    }
     default:
       return 0;                                // 熄灭 = 全暗
   }
@@ -67,7 +116,10 @@ static void updateLevel(uint32_t nowMs) {
   const int32_t target = targetLevel(nowMs);
   if (currentLevel == target) return;
 
-  const int32_t maxStep = (int32_t)((dt * (uint32_t)kLevelMax) / kFadeFullScaleMs);
+  // SOS 的短信号只有 200 ms，若沿用 700 ms 斜坡会来不及达到全亮，所以单独用更快的斜率。
+  const uint32_t fadeFullScaleMs =
+      (currentMode == MODE_SOS) ? kSosFadeFullScaleMs : kFadeFullScaleMs;
+  const int32_t maxStep = (int32_t)((dt * (uint32_t)kLevelMax) / fadeFullScaleMs);
   if (currentLevel < target) {
     currentLevel += maxStep;
     if (currentLevel > target) currentLevel = target;
@@ -100,6 +152,7 @@ void setup() {
 
   lastFrameMs   = millis();
   breathStartMs = lastFrameMs;
+  sosStartMs    = lastFrameMs;
 
   Serial.begin(115200);
   delay(1000);
@@ -109,6 +162,7 @@ void setup() {
   Serial.println("  输入 [0] : 关闭 LED（渐暗）");
   Serial.println("  输入 [1] : 常亮 LED（渐亮）");
   Serial.println("  输入 [2] : 开启呼吸灯模式（渐入）");
+  Serial.println("  输入 [3] : SOS 求救信号（三短三长三短）");
   Serial.println("======================================");
 }
 
@@ -117,8 +171,8 @@ void loop() {
   while (Serial.available() > 0) {
     const char incomingChar = Serial.read();
 
-    // 过滤掉回车换行等无关字符，只处理 0/1/2
-    if (incomingChar == '0' || incomingChar == '1' || incomingChar == '2') {
+    // 过滤掉回车换行等无关字符，只处理 0/1/2/3
+    if (incomingChar >= '0' && incomingChar <= '3') {
       Serial.print(">> 收到电脑指令: ");
       Serial.println(incomingChar);
 
@@ -130,10 +184,14 @@ void loop() {
       } else if (incomingChar == '1') {
         currentMode = MODE_ON;
         Serial.println("状态更新：LED 渐亮至常亮。");
-      } else {
+      } else if (incomingChar == '2') {
         currentMode = MODE_BREATH;
         breathStartMs = millis();  // 重置相位：从最暗起步，接上前一刻的亮度做一次柔和过渡
         Serial.println("状态更新：进入呼吸灯模式...");
+      } else {
+        currentMode = MODE_SOS;
+        sosStartMs = millis();  // 从 SOS 的第一个短信号开始
+        Serial.println("状态更新：进入 SOS 求救信号模式...");
       }
     }
   }
